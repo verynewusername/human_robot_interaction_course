@@ -21,7 +21,7 @@ conversation_history = []
 def get_robot_response(user_input):
     conversation_history.append(user_input)
     response = chatbot.models.generate_content(
-        model="GEMMA 3 27b",
+        model="gemini-2.0-flash",
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT
         ),
