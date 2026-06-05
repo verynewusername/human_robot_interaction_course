@@ -13,10 +13,10 @@ load_dotenv()
 # WORD SETS PER TOPIC
 # ─────────────────────────────────────────────
 TOPICS = {
-    "animals": ["dog", "bird", "fish", "cat", "elephant"],
-    "food":    ["apple", "bread", "soup", "cake", "rice"],
-    "school":  ["pencil", "book", "teacher", "desk", "class"],
-    "weather": ["rain", "sun", "cloud", "wind", "snow"],
+    "animals": ["dog", "bird", "fish", "cat", "elephant", "rabbit", "horse", "frog", "lion", "turtle", "bear", "duck"],
+    "food":    ["apple", "bread", "soup", "cake", "rice", "banana", "cheese", "egg", "milk", "pizza", "carrot", "cookie"],
+    "school":  ["pencil", "book", "teacher", "desk", "class", "bag", "pen", "eraser", "chair", "board", "ruler", "homework"],
+    "weather": ["rain", "sun", "cloud", "wind", "snow", "storm", "rainbow", "fog", "ice", "thunder", "hail", "breeze"],
 }
 
 # ─────────────────────────────────────────────
