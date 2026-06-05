@@ -1,6 +1,5 @@
 from autobahn.twisted.component import Component, run
 from twisted.internet.defer import inlineCallbacks
-from autobahn.twisted.util import sleep
 from google import genai
 from google.genai import types
 import random
@@ -8,9 +7,26 @@ import os
 import time
 import json
 import re
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ─────────────────────────────────────────────
+# LOCAL TEST FLAG
+# Run with: python main.py --local-test
+# Skips robot connection entirely; uses terminal for I/O.
+# ─────────────────────────────────────────────
+LOCAL_TEST = "--local-test" in sys.argv
+
+if LOCAL_TEST:
+    print("[LOCAL TEST MODE] Robot connection disabled. Using terminal I/O.")
+    from twisted.internet.defer import succeed
+
+    def sleep(seconds):
+        return succeed(None)   # instant, no actual wait
+else:
+    from autobahn.twisted.util import sleep
 
 # ─────────────────────────────────────────────
 # WORD SETS PER TOPIC  (easy → hard order)
@@ -34,10 +50,8 @@ TOPICS = {
     },
 }
 
-# How long (seconds) to wait for the child to speak before giving up
 LISTEN_TIMEOUT = 15
-
-STREAK_THRESHOLD = 3   # consecutive correct answers to trigger celebration
+STREAK_THRESHOLD = 3
 
 # ─────────────────────────────────────────────
 # GEMINI CLIENT
@@ -90,9 +104,7 @@ Respond ONLY in this exact JSON format (no extra text):
 }
 
 If valid is true, reason must be an empty string.
-If valid is false, reason must explain simply what is wrong
-(e.g. 'You used dog but forgot to use rain.' or
-'Your sentence is missing a verb.').
+If valid is false, reason must explain simply what is wrong.
 Keep encouragement warm, short and suitable for a child.
 """
 
@@ -114,9 +126,7 @@ def validate_sentence(words, sentence):
         try:
             response = chatbot.models.generate_content(
                 model="gemini-2.0-flash",
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt
-                ),
+                config=types.GenerateContentConfig(system_instruction=system_prompt),
                 contents=[prompt]
             )
             raw = response.text.strip()
@@ -135,7 +145,7 @@ def validate_sentence(words, sentence):
                 raise
 
 # ─────────────────────────────────────────────
-# STT GLOBALS
+# STT GLOBALS  (unused in local test)
 # ─────────────────────────────────────────────
 finish_dialogue = False
 query = ""
@@ -152,16 +162,21 @@ def asr(frames):
 # ─────────────────────────────────────────────
 @inlineCallbacks
 def say(session, text):
-    """Speak and print."""
-    print("Robot:", text)
-    yield session.call("rie.dialogue.say_animated", text=text)
+    """Speak (or print in local test)."""
+    print(f"Robot: {text}")
+    if not LOCAL_TEST:
+        yield session.call("rie.dialogue.say_animated", text=text)
 
 @inlineCallbacks
 def listen(session, timeout=LISTEN_TIMEOUT):
     """
-    Wait for the child to finish speaking.
-    Returns the utterance, or empty string if timeout is reached.
+    In local test: read from stdin.
+    On robot: wait for STT with timeout.
     """
+    if LOCAL_TEST:
+        utterance = input("You: ").strip()
+        return utterance
+
     global finish_dialogue, query
     finish_dialogue = False
     query = ""
@@ -209,13 +224,11 @@ def pick_topic(session):
 @inlineCallbacks
 def play_round(session, words, round_number, total_rounds, streak_state):
     """
-    Play one round. words is a str (stages 1&2) or list of two str (stage 3).
-    streak_state is a dict with key 'count' so we can mutate it across rounds.
+    Play one round. words is a str (stages 1 & 2) or list of two str (stage 3).
     Returns True if the child succeeded.
     """
     MAX_RETRIES = 4
 
-    # Build the prompt text depending on stage
     if isinstance(words, list):
         word_display = f"'{words[0]}' and '{words[1]}'"
         task = f"Can you make one sentence using both words: {word_display}?"
@@ -275,7 +288,7 @@ def run_game(session, topic):
     Run one full 3-stage game for the given topic.
     Stage 1: easy words (one word per round)
     Stage 2: hard words (one word per round)
-    Stage 3: two random words from the full pool per round (4 rounds)
+    Stage 3: 4 rounds, each with 2 random words in one sentence
     Returns total score.
     """
     easy_words = TOPICS[topic]["easy"].copy()
@@ -285,12 +298,9 @@ def run_game(session, topic):
     random.shuffle(easy_words)
     random.shuffle(hard_words)
 
-    # Stage 3: 4 pairs of random words (no pair repeats)
-    stage3_pairs = []
     pool = all_words.copy()
     random.shuffle(pool)
-    for i in range(0, 8, 2):          # 4 pairs
-        stage3_pairs.append([pool[i], pool[i + 1]])
+    stage3_pairs = [[pool[i], pool[i + 1]] for i in range(0, 8, 2)]
 
     rounds = (
         [(w, 1) for w in easy_words] +
@@ -300,9 +310,13 @@ def run_game(session, topic):
     total = len(rounds)
     score = 0
     streak_state = {"count": 0}
-
-    stage_labels = {1: "Stage 1 — easy words", 2: "Stage 2 — harder words", 3: "Stage 3 — two words at once!"}
     current_stage = 0
+
+    stage_labels = {
+        1: "Stage 1 — easy words",
+        2: "Stage 2 — harder words",
+        3: "Stage 3 — two words at once!",
+    }
 
     for i, (words, stage) in enumerate(rounds, start=1):
         if stage != current_stage:
@@ -322,9 +336,10 @@ def run_game(session, topic):
 # ─────────────────────────────────────────────
 @inlineCallbacks
 def main(session, details):
-    yield session.call("rie.dialogue.config.language", lang="en")
-    yield session.call("rom.optional.behavior.play", name="BlocklyStand")
-    yield session.subscribe(asr, "rie.dialogue.stt.stream")
+    if not LOCAL_TEST:
+        yield session.call("rie.dialogue.config.language", lang="en")
+        yield session.call("rom.optional.behavior.play", name="BlocklyStand")
+        yield session.subscribe(asr, "rie.dialogue.stt.stream")
 
     yield say(session,
               "Hello! I am your language buddy. "
@@ -354,23 +369,35 @@ def main(session, details):
             yield say(session, "Okay! Great job today. Goodbye and keep up the amazing work!")
             break
 
-    yield sleep(1)
-    yield session.call("rom.optional.behavior.play", name="BlocklyCrouch")
-    session.leave()
+    if not LOCAL_TEST:
+        yield sleep(1)
+        yield session.call("rom.optional.behavior.play", name="BlocklyCrouch")
+        session.leave()
 
 # ─────────────────────────────────────────────
-# WAMP CONNECTION
+# ENTRY POINT
 # ─────────────────────────────────────────────
-wamp = Component(
-    transports=[{
-        "url": "ws://wamp.robotsindeklas.nl",
-        "serializers": ["msgpack"],
-        "max_retries": 0
-    }],
-    realm=os.getenv("WAMP_REALM"),
-)
+if LOCAL_TEST:
+    from twisted.internet import reactor
+    from twisted.internet.defer import inlineCallbacks as ib
 
-wamp.on_join(main)
+    @ib
+    def _run_local():
+        yield main(None, None)
+        reactor.stop()
 
-if __name__ == "__main__":
-    run([wamp])
+    reactor.callLater(0, _run_local)
+    reactor.run()
+else:
+    wamp = Component(
+        transports=[{
+            "url": "ws://wamp.robotsindeklas.nl",
+            "serializers": ["msgpack"],
+            "max_retries": 0
+        }],
+        realm=os.getenv("WAMP_REALM"),
+    )
+    wamp.on_join(main)
+
+    if __name__ == "__main__":
+        run([wamp])
