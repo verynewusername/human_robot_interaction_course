@@ -15,21 +15,31 @@ load_dotenv()
 # ─────────────────────────────────────────────
 # LOCAL TEST FLAG
 # Run with: python main.py --local-test
-# Skips robot connection entirely; uses terminal for I/O.
 # ─────────────────────────────────────────────
 LOCAL_TEST = "--local-test" in sys.argv
 
 if LOCAL_TEST:
     print("[LOCAL TEST MODE] Robot connection disabled. Using terminal I/O.")
     from twisted.internet.defer import succeed
-
     def sleep(seconds):
-        return succeed(None)   # instant, no actual wait
+        return succeed(None)
 else:
     from autobahn.twisted.util import sleep
 
 # ─────────────────────────────────────────────
-# WORD SETS PER TOPIC  (easy → hard order)
+# GAME SETTINGS
+# ─────────────────────────────────────────────
+LISTEN_TIMEOUT   = 15
+STREAK_THRESHOLD = 3
+QUESTIONS_PER_ROUND = 2   # questions at the same difficulty before re-evaluating
+MAX_ROUNDS       = 5      # game ends after this many rounds regardless
+
+# Stages: 1 = easy word, 2 = hard word, 3 = two words
+MIN_STAGE = 1
+MAX_STAGE = 3
+
+# ─────────────────────────────────────────────
+# WORD SETS PER TOPIC
 # ─────────────────────────────────────────────
 TOPICS = {
     "animals": {
@@ -49,9 +59,6 @@ TOPICS = {
         "hard": ["cloud", "storm", "rainbow", "thunder", "hail", "breeze"],
     },
 }
-
-LISTEN_TIMEOUT = 15
-STREAK_THRESHOLD = 3
 
 # ─────────────────────────────────────────────
 # GEMINI CLIENT
@@ -110,8 +117,7 @@ Keep encouragement warm, short and suitable for a child.
 
 def validate_sentence(words, sentence):
     """
-    Ask Gemini to validate the child's sentence.
-    words: a single word (str) or a list of two words.
+    words: str (stages 1 & 2) or list of two str (stage 3).
     Returns (is_valid, reason, encouragement).
     """
     if isinstance(words, list):
@@ -145,7 +151,7 @@ def validate_sentence(words, sentence):
                 raise
 
 # ─────────────────────────────────────────────
-# STT GLOBALS  (unused in local test)
+# STT GLOBALS
 # ─────────────────────────────────────────────
 finish_dialogue = False
 query = ""
@@ -162,17 +168,12 @@ def asr(frames):
 # ─────────────────────────────────────────────
 @inlineCallbacks
 def say(session, text):
-    """Speak (or print in local test)."""
     print(f"Robot: {text}")
     if not LOCAL_TEST:
         yield session.call("rie.dialogue.say_animated", text=text)
 
 @inlineCallbacks
 def listen(session, timeout=LISTEN_TIMEOUT):
-    """
-    In local test: read from stdin.
-    On robot: wait for STT with timeout.
-    """
     if LOCAL_TEST:
         utterance = input("You: ").strip()
         return utterance
@@ -201,31 +202,39 @@ def listen(session, timeout=LISTEN_TIMEOUT):
     query = ""
     return result
 
-@inlineCallbacks
-def pick_topic(session):
-    """Let the child choose a topic. Returns the chosen topic key."""
-    topic_list = ", ".join(TOPICS.keys())
-    yield say(session, f"Which topic would you like? You can choose: {topic_list}.")
-    yield sleep(1)
-
-    while True:
-        answer = yield listen(session)
-        if not answer:
-            yield say(session, f"I did not hear you. Please choose one of: {topic_list}.")
-            yield sleep(0.5)
-            continue
-        for topic in TOPICS:
-            if topic in answer.lower():
-                yield say(session, f"Awesome! Let's go with {topic}!")
-                return topic
-        yield say(session, f"Hmm, I did not catch that. Please choose one of: {topic_list}.")
-        yield sleep(0.5)
-
-@inlineCallbacks
-def play_round(session, words, round_number, total_rounds, streak_state):
+def pick_words(topic, stage, used_words):
     """
-    Play one round. words is a str (stages 1 & 2) or list of two str (stage 3).
-    Returns True if the child succeeded.
+    Pick word(s) for the current stage, avoiding repeats where possible.
+    Returns a str (stages 1 & 2) or list of two str (stage 3).
+    """
+    easy = TOPICS[topic]["easy"]
+    hard = TOPICS[topic]["hard"]
+    all_words = easy + hard
+
+    if stage == 1:
+        pool = [w for w in easy if w not in used_words] or easy
+        word = random.choice(pool)
+        used_words.add(word)
+        return word
+    elif stage == 2:
+        pool = [w for w in hard if w not in used_words] or hard
+        word = random.choice(pool)
+        used_words.add(word)
+        return word
+    else:  # stage 3
+        pool = [w for w in all_words if w not in used_words]
+        if len(pool) < 2:
+            pool = all_words
+        pair = random.sample(pool, 2)
+        used_words.update(pair)
+        return pair
+
+STAGE_LABELS = {1: "easy words", 2: "harder words", 3: "two words at once"}
+
+@inlineCallbacks
+def play_question(session, words, q_number, total_q, streak_state):
+    """
+    Ask one question. Returns True if child succeeded.
     """
     MAX_RETRIES = 4
 
@@ -236,7 +245,7 @@ def play_round(session, words, round_number, total_rounds, streak_state):
         word_display = f"'{words}'"
         task = f"Can you make a sentence using the word {word_display}?"
 
-    yield say(session, f"Round {round_number} of {total_rounds}. Your word is: {word_display}. {task}")
+    yield say(session, f"Question {q_number} of {total_q}. {task}")
     yield sleep(1)
 
     for attempt in range(1, MAX_RETRIES + 1):
@@ -263,21 +272,14 @@ def play_round(session, words, round_number, total_rounds, streak_state):
             if attempt < MAX_RETRIES:
                 retries_left = MAX_RETRIES - attempt
                 retry_word = "try" if retries_left == 1 else "tries"
-                feedback = (
-                    f"{reason} "
-                    f"You have {retries_left} more {retry_word}. "
-                    f"Remember to use {word_display}. Give it another go!"
-                )
+                yield say(session,
+                          f"{reason} You have {retries_left} more {retry_word}. "
+                          f"Remember to use {word_display}. Give it another go!")
             else:
-                if isinstance(words, list):
-                    example = f"'I see a {words[0]} in the {words[1]}.'"
-                else:
-                    example = f"'I like the {words}.'"
-                feedback = (
-                    f"{reason} "
-                    f"That was a tough one! A good sentence could be: {example} Let's move on!"
-                )
-            yield say(session, feedback)
+                example = (f"'I see a {words[0]} in the {words[1]}.'"
+                           if isinstance(words, list) else f"'I like the {words}.'")
+                yield say(session,
+                          f"{reason} That was a tough one! A good sentence could be: {example} Let's move on!")
             yield sleep(1)
 
     return False
@@ -285,51 +287,64 @@ def play_round(session, words, round_number, total_rounds, streak_state):
 @inlineCallbacks
 def run_game(session, topic):
     """
-    Run one full 3-stage game for the given topic.
-    Stage 1: easy words (one word per round)
-    Stage 2: hard words (one word per round)
-    Stage 3: 4 rounds, each with 2 random words in one sentence
-    Returns total score.
+    Adaptive game loop:
+    - Each round = QUESTIONS_PER_ROUND questions at the current stage
+    - 2/2 correct → stage up | 0/2 correct → stage down | 1/2 → stay
+    - Ends after MAX_ROUNDS rounds
     """
-    easy_words = TOPICS[topic]["easy"].copy()
-    hard_words = TOPICS[topic]["hard"].copy()
-    all_words  = easy_words + hard_words
-
-    random.shuffle(easy_words)
-    random.shuffle(hard_words)
-
-    pool = all_words.copy()
-    random.shuffle(pool)
-    stage3_pairs = [[pool[i], pool[i + 1]] for i in range(0, 8, 2)]
-
-    rounds = (
-        [(w, 1) for w in easy_words] +
-        [(w, 2) for w in hard_words] +
-        [(p, 3) for p in stage3_pairs]
-    )
-    total = len(rounds)
-    score = 0
+    stage = MIN_STAGE
     streak_state = {"count": 0}
-    current_stage = 0
+    used_words = set()
+    total_score = 0
+    total_questions = MAX_ROUNDS * QUESTIONS_PER_ROUND
+    q_number = 0
 
-    stage_labels = {
-        1: "Stage 1 — easy words",
-        2: "Stage 2 — harder words",
-        3: "Stage 3 — two words at once!",
-    }
+    for round_num in range(1, MAX_ROUNDS + 1):
+        yield say(session,
+                  f"Round {round_num} of {MAX_ROUNDS} — {STAGE_LABELS[stage]}!")
+        yield sleep(1)
 
-    for i, (words, stage) in enumerate(rounds, start=1):
-        if stage != current_stage:
-            current_stage = stage
-            yield say(session, f"Now starting {stage_labels[stage]}!")
-            yield sleep(1)
+        round_score = 0
+        for _ in range(QUESTIONS_PER_ROUND):
+            q_number += 1
+            words = pick_words(topic, stage, used_words)
+            success = yield play_question(session, words, q_number, total_questions, streak_state)
+            if success:
+                round_score += 1
+                total_score += 1
+            yield sleep(0.5)
 
-        success = yield play_round(session, words, i, total, streak_state)
-        if success:
-            score += 1
+        # Adaptive stage adjustment
+        if round_score == QUESTIONS_PER_ROUND and stage < MAX_STAGE:
+            stage += 1
+            yield say(session, "Great job! Let's make it a bit harder.")
+        elif round_score == 0 and stage > MIN_STAGE:
+            stage -= 1
+            yield say(session, "No worries! Let's go back to something easier.")
+        # else: stay at same stage, no announcement needed
+
         yield sleep(0.5)
 
-    return score
+    return total_score, total_questions
+
+@inlineCallbacks
+def pick_topic(session):
+    topic_list = ", ".join(TOPICS.keys())
+    yield say(session, f"Which topic would you like? You can choose: {topic_list}.")
+    yield sleep(1)
+
+    while True:
+        answer = yield listen(session)
+        if not answer:
+            yield say(session, f"I did not hear you. Please choose one of: {topic_list}.")
+            yield sleep(0.5)
+            continue
+        for topic in TOPICS:
+            if topic in answer.lower():
+                yield say(session, f"Awesome! Let's go with {topic}!")
+                return topic
+        yield say(session, f"Hmm, I did not catch that. Please choose one of: {topic_list}.")
+        yield sleep(0.5)
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -343,22 +358,20 @@ def main(session, details):
 
     yield say(session,
               "Hello! I am your language buddy. "
-              "We are going to play a fun sentence game with three stages. "
-              "Let's start easy and get harder as we go!")
+              "We are going to play a sentence game. "
+              "I will adjust the difficulty based on how you do. Let's go!")
     yield sleep(1)
 
     while True:
         chosen_topic = yield pick_topic(session)
-        score = yield run_game(session, chosen_topic)
-        total = len(TOPICS[chosen_topic]["easy"]) + len(TOPICS[chosen_topic]["hard"]) + 4
+        score, total = yield run_game(session, chosen_topic)
 
         yield say(session,
-                  f"Amazing work! You completed all three stages. "
-                  f"You got {score} out of {total} correct. "
-                  f"You are doing so well! Keep practising and you will be a sentence superstar!")
+                  f"Amazing work! You got {score} out of {total} correct. "
+                  f"You are doing so well! Keep practising!")
         yield sleep(2)
 
-        yield say(session, "Would you like to play again with a different topic? Say yes or no.")
+        yield say(session, "Would you like to play again? Say yes or no.")
         yield sleep(1)
         answer = yield listen(session)
 
