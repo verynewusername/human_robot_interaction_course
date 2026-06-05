@@ -18,10 +18,9 @@ load_dotenv()
 # python main.py                → Ollama local (default)
 # python main.py --gemini       → Gemini/Gemma cloud API
 # python main.py --local-test   → terminal I/O, no robot
-# Flags can be combined: python main.py --local-test --gemini
 # ─────────────────────────────────────────────
-LOCAL_TEST  = "--local-test" in sys.argv
-USE_GEMINI  = "--gemini"     in sys.argv
+LOCAL_TEST = "--local-test" in sys.argv
+USE_GEMINI = "--gemini"     in sys.argv
 
 if LOCAL_TEST:
     print("[LOCAL TEST MODE] Robot connection disabled. Using terminal I/O.")
@@ -32,18 +31,26 @@ else:
     from autobahn.twisted.util import sleep
 
 # ─────────────────────────────────────────────
-# OLLAMA CONFIG  (used when --gemini is NOT passed)
+# WAMP REALM GUARD
 # ─────────────────────────────────────────────
-OLLAMA_URL   = "http://localhost:11434"
-OLLAMA_API   = f"{OLLAMA_URL}/api/chat"
-OLLAMA_TAGS  = f"{OLLAMA_URL}/api/tags"
+if not LOCAL_TEST:
+    _realm = os.getenv("WAMP_REALM", "").strip()
+    if not _realm:
+        print(
+            "\n[FATAL] WAMP_REALM is not set or is empty in your .env file.\n"
+            "  Add a line like:  WAMP_REALM=rie.your_realm_here\n"
+            "  Then restart the program.\n"
+        )
+        sys.exit(1)
+
+# ─────────────────────────────────────────────
+# OLLAMA CONFIG
+# ─────────────────────────────────────────────
+OLLAMA_URL  = "http://localhost:11434"
+OLLAMA_API  = f"{OLLAMA_URL}/api/chat"
+OLLAMA_TAGS = f"{OLLAMA_URL}/api/tags"
 
 def _detect_ollama_model():
-    """
-    Auto-detect the first Gemma model available in Ollama.
-    Falls back to the first available model of any kind.
-    Raises RuntimeError if Ollama is unreachable or has no models.
-    """
     try:
         resp = requests.get(OLLAMA_TAGS, timeout=5)
         resp.raise_for_status()
@@ -53,14 +60,11 @@ def _detect_ollama_model():
             f"[Ollama] Cannot reach Ollama at {OLLAMA_URL}. "
             f"Is it running? (`ollama serve`)  Error: {e}"
         )
-
     if not models:
         raise RuntimeError(
             "[Ollama] Ollama is running but has no models pulled. "
-            "Run: ollama pull gemma3  (or any other model)"
+            "Run: ollama pull gemma3"
         )
-
-    # prefer any gemma variant
     gemma_models = [m for m in models if "gemma" in m.lower()]
     chosen = gemma_models[0] if gemma_models else models[0]
     print(f"[Ollama] Auto-detected model: {chosen}")
@@ -70,7 +74,7 @@ if not USE_GEMINI:
     OLLAMA_MODEL = _detect_ollama_model()
 
 # ─────────────────────────────────────────────
-# GEMINI CONFIG  (used when --gemini IS passed)
+# GEMINI CONFIG
 # ─────────────────────────────────────────────
 GEMINI_MODEL = "gemini-1.5-flash"
 
@@ -160,10 +164,9 @@ Keep encouragement warm, short and suitable for a child.
 """
 
 # ─────────────────────────────────────────────
-# VALIDATION — Ollama path
+# VALIDATION — Ollama
 # ─────────────────────────────────────────────
 def _validate_ollama(system_prompt, user_prompt):
-    """Call local Ollama, return parsed JSON dict."""
     payload = {
         "model": OLLAMA_MODEL,
         "messages": [
@@ -171,21 +174,19 @@ def _validate_ollama(system_prompt, user_prompt):
             {"role": "user",   "content": user_prompt},
         ],
         "stream": False,
-        "format": "json",       # Ollama structured output — forces valid JSON
+        "format": "json",
     }
     resp = requests.post(OLLAMA_API, json=payload, timeout=60)
     resp.raise_for_status()
     raw = resp.json()["message"]["content"].strip()
-    # strip fences just in case
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
     return json.loads(raw)
 
 # ─────────────────────────────────────────────
-# VALIDATION — Gemini path
+# VALIDATION — Gemini
 # ─────────────────────────────────────────────
 def _validate_gemini(system_prompt, user_prompt):
-    """Call Gemini cloud API, return parsed JSON dict."""
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -211,14 +212,9 @@ def _validate_gemini(system_prompt, user_prompt):
     raise RuntimeError("Gemini: max retries exceeded")
 
 # ─────────────────────────────────────────────
-# UNIFIED VALIDATE ENTRY POINT
+# UNIFIED VALIDATE
 # ─────────────────────────────────────────────
 def validate_sentence(words, sentence):
-    """
-    words: str (stages 1 & 2) or list of two str (stage 3).
-    Returns (is_valid, reason, encouragement).
-    Routes to Ollama or Gemini based on flag.
-    """
     if isinstance(words, list):
         user_prompt   = f"Target words: {words[0]}, {words[1]}\nChild's sentence: {sentence}"
         system_prompt = VALIDATOR_PROMPT_TWO
@@ -227,18 +223,14 @@ def validate_sentence(words, sentence):
         system_prompt = VALIDATOR_PROMPT_ONE
 
     try:
-        if USE_GEMINI:
-            data = _validate_gemini(system_prompt, user_prompt)
-        else:
-            data = _validate_ollama(system_prompt, user_prompt)
-
+        data = _validate_gemini(system_prompt, user_prompt) if USE_GEMINI \
+               else _validate_ollama(system_prompt, user_prompt)
         return (
             data["valid"],
             data.get("reason", ""),
             data.get("encouragement", "Well done!")
         )
     except Exception as e:
-        # graceful fallback: treat as invalid so game can continue
         print(f"  [validate_sentence] Error: {e}")
         return False, "I had trouble checking that. Please try again.", "Give it another go!"
 
@@ -250,22 +242,73 @@ query = ""
 
 def asr(frames):
     global finish_dialogue, query
-    if frames["data"]["body"]["final"] and not finish_dialogue:
-        query = str(frames["data"]["body"]["text"]).strip()
-        print("Person said:", query)
-        finish_dialogue = True
+    try:
+        body = frames["data"]["body"]
+        if body.get("final") and not finish_dialogue:
+            query = str(body.get("text", "")).strip()
+            print("Person said:", query)
+            finish_dialogue = True
+    except (KeyError, TypeError) as e:
+        print(f"  [asr] Unexpected frame format: {e}")
 
 # ─────────────────────────────────────────────
-# QR GLOBALS
+# GRAB FRAME — robot camera via WAMP
+# Confirmed payload:
+#   list → [0] → 'data' → 'body.head.eyes' → raw JPEG bytes
 # ─────────────────────────────────────────────
-qr_result = None
+@inlineCallbacks
+def grab_frame(session):
+    try:
+        result = yield session.call("rom.sensor.sight.read")
 
-def on_qr(frames):
-    global qr_result
-    value = frames["data"]["body"].get("text", "").strip().lower()
-    if value and qr_result is None:
-        print(f"QR detected: {value}")
-        qr_result = value
+        if not isinstance(result, list) or len(result) == 0:
+            print(f"  [Sight] Unexpected result type: {type(result)}")
+            return None
+
+        img_bytes = result[0].get("data", {}).get("body.head.eyes")
+
+        if isinstance(img_bytes, (bytes, bytearray)):
+            return bytes(img_bytes)
+
+        print(f"  [Sight] 'body.head.eyes' missing or wrong type: "
+              f"{type(img_bytes)}")
+        return None
+
+    except Exception as e:
+        print(f"  [Sight] rom.sensor.sight.read error: {e}")
+        return None
+
+# ─────────────────────────────────────────────
+# QR DECODE — OpenCV (no system library needed on macOS)
+# Requires: pip install opencv-python
+# ─────────────────────────────────────────────
+def decode_qr(jpeg_bytes):
+    """
+    Decode a QR code from JPEG bytes using OpenCV's built-in QR detector.
+    Works on macOS without any Homebrew/system library dependency.
+    """
+    try:
+        import cv2
+        import numpy as np
+
+        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            print("  [QR] cv2.imdecode returned None — bad JPEG?")
+            return None
+
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(img)
+        if data:
+            return data.strip().lower()
+        return None
+
+    except ImportError:
+        print("  [QR] opencv-python not installed. Run: pip install opencv-python")
+        return None
+    except Exception as e:
+        print(f"  [QR] Decode error: {e}")
+        return None
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -285,7 +328,12 @@ def listen(session, timeout=LISTEN_TIMEOUT):
     global finish_dialogue, query
     finish_dialogue = False
     query = ""
-    yield session.call("rie.dialogue.stt.stream")
+
+    try:
+        yield session.call("rie.dialogue.stt.stream")
+    except Exception as e:
+        print(f"  [listen] Could not start STT stream: {e}")
+        return ""
 
     elapsed = 0.0
     while not finish_dialogue:
@@ -293,13 +341,19 @@ def listen(session, timeout=LISTEN_TIMEOUT):
         elapsed += 0.5
         if elapsed >= timeout:
             print(f"  [listen] Timeout after {timeout}s")
-            yield session.call("rie.dialogue.stt.close")
+            try:
+                yield session.call("rie.dialogue.stt.close")
+            except Exception:
+                pass
             yield sleep(0.3)
             finish_dialogue = False
             query = ""
             return ""
 
-    yield session.call("rie.dialogue.stt.close")
+    try:
+        yield session.call("rie.dialogue.stt.close")
+    except Exception:
+        pass
     yield sleep(0.5)
     result = query
     finish_dialogue = False
@@ -307,8 +361,8 @@ def listen(session, timeout=LISTEN_TIMEOUT):
     return result
 
 def pick_words(topic, stage, used_words):
-    easy = TOPICS[topic]["easy"]
-    hard = TOPICS[topic]["hard"]
+    easy      = TOPICS[topic]["easy"]
+    hard      = TOPICS[topic]["hard"]
     all_words = easy + hard
 
     if stage == 1:
@@ -418,9 +472,13 @@ def run_game(session, topic):
 
     return total_score, 6
 
+# ─────────────────────────────────────────────
+# TOPIC SELECTION — snapshot QR loop
+# Grabs a JPEG from the robot's eye camera every second,
+# decodes any QR code locally with OpenCV.
+# ─────────────────────────────────────────────
 @inlineCallbacks
 def pick_topic(session):
-    global qr_result
     topic_list = ", ".join(TOPICS.keys())
 
     if LOCAL_TEST:
@@ -441,35 +499,54 @@ def pick_topic(session):
             yield say(session,
                       f"Hmm, I did not catch that. Please choose one of: {topic_list}.")
             yield sleep(0.5)
-    else:
-        yield say(session,
-                  f"Show me a topic card to get started! "
-                  f"You can choose: {topic_list}.")
-        yield session.call("rie.vision.qrcode.stream")
+        return
 
-        while True:
-            qr_result = None
-            elapsed   = 0.0
-            while qr_result is None:
-                yield sleep(0.5)
-                elapsed += 0.5
-                if elapsed > 30:
-                    yield say(session,
-                              f"I did not see a card. "
-                              f"Please show me one of: {topic_list}.")
-                    elapsed = 0.0
+    # ── Robot mode: snapshot QR loop ─────────────────────────────────
+    yield say(session,
+              f"Show me a topic card! "
+              f"You can choose: {topic_list}.")
 
-            topic     = qr_result.lower().strip()
-            qr_result = None
+    try:
+        yield session.call("rom.sensor.sight.stream")
+        print("[Sight] Camera stream started.")
+    except Exception as e:
+        print(f"[Sight] Could not start stream (continuing anyway): {e}")
 
-            if topic in TOPICS:
-                yield session.call("rie.vision.qrcode.close")
-                yield say(session, f"Awesome! Let's go with {topic}!")
-                return topic
+    yield sleep(0.5)
+
+    elapsed_no_card = 0
+    print("[Sight] Scanning for QR — hold card in front of robot camera...")
+
+    while True:
+        raw = yield grab_frame(session)
+
+        if raw is None:
+            elapsed_no_card += 1
+        else:
+            text = decode_qr(raw)
+            if text:
+                print(f"[QR] Decoded: '{text}'")
+                if text in TOPICS:
+                    try:
+                        yield session.call("rom.sensor.sight.close")
+                        print("[Sight] Camera closed.")
+                    except Exception:
+                        pass
+                    yield say(session, f"Awesome! Let's go with {text}!")
+                    return text
+                else:
+                    print(f"  [QR] '{text}' not a valid topic, ignoring.")
+                    elapsed_no_card = 0
             else:
-                yield say(session,
-                          f"I do not recognise that card. "
-                          f"Please try one of: {topic_list}.")
+                elapsed_no_card += 1
+
+        if elapsed_no_card >= 30:
+            yield say(session,
+                      f"I cannot see a card yet. "
+                      f"Please hold one closer to my eyes: {topic_list}.")
+            elapsed_no_card = 0
+
+        yield sleep(1)
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -480,7 +557,8 @@ def main(session, details):
         yield session.call("rie.dialogue.config.language", lang="en")
         yield session.call("rom.optional.behavior.play", name="BlocklyStand")
         yield session.subscribe(asr, "rie.dialogue.stt.stream")
-        yield session.subscribe(on_qr, "rie.vision.qrcode")
+        print("[WAMP] STT subscription registered.")
+        yield sleep(0.5)
 
     yield say(session,
               "Hello! I am your language buddy. "
@@ -501,7 +579,7 @@ def main(session, details):
         yield sleep(1)
         answer = yield listen(session)
 
-        if "yes" in answer.lower():
+        if answer and "yes" in answer.lower():
             yield say(session, "Wonderful! Let's go again!")
             yield sleep(1)
         else:
