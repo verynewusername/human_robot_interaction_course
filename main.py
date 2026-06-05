@@ -6,6 +6,8 @@ from google.genai import types
 import random
 import os
 import time
+import json
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -20,14 +22,17 @@ TOPICS = {
     "weather": ["rain", "sun", "cloud", "wind", "snow", "storm", "rainbow", "fog", "ice", "thunder", "hail", "breeze"],
 }
 
+# How long (seconds) to wait for the child to speak before giving up
+LISTEN_TIMEOUT = 15
+
 # ─────────────────────────────────────────────
 # GEMINI CLIENT
 # ─────────────────────────────────────────────
 chatbot = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 VALIDATOR_PROMPT = """
-You are a friendly speech and language therapist helping a child with 
-Developmental Language Disorder (DLD). 
+You are a friendly speech and language therapist helping a child with
+Developmental Language Disorder (DLD).
 
 Your job is to evaluate whether the child's sentence:
 1. Is grammatically valid (has at least a subject and a verb)
@@ -46,8 +51,8 @@ Respond ONLY in this exact JSON format (no extra text):
 }
 
 If valid is true, reason must be an empty string.
-If valid is false, reason must explain simply what is wrong 
-(e.g. 'Your sentence is missing a verb.' or 
+If valid is false, reason must explain simply what is wrong
+(e.g. 'Your sentence is missing a verb.' or
 'The word dog was not used in the sentence.').
 Keep encouragement warm, short and suitable for a child.
 """
@@ -66,9 +71,7 @@ def validate_sentence(target_word, sentence):
                 ),
                 contents=[prompt]
             )
-            import json, re
             raw = response.text.strip()
-            # strip markdown code fences if Gemini wraps in ```json ... ```
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
             data = json.loads(raw)
@@ -76,8 +79,7 @@ def validate_sentence(target_word, sentence):
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                import re as re2
-                match = re2.search(r"retry in ([\d.]+)s", error_str)
+                match = re.search(r"retry in ([\d.]+)s", error_str)
                 delay = float(match.group(1)) if match else min(2 ** attempt, 30)
                 print(f"  Rate limited. Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})...")
                 time.sleep(delay)
@@ -107,14 +109,28 @@ def say(session, text):
     yield session.call("rie.dialogue.say_animated", text=text)
 
 @inlineCallbacks
-def listen(session):
-    """Wait for the child to finish speaking. Returns the utterance."""
+def listen(session, timeout=LISTEN_TIMEOUT):
+    """
+    Wait for the child to finish speaking.
+    Returns the utterance, or empty string if timeout is reached.
+    """
     global finish_dialogue, query
     finish_dialogue = False
     query = ""
     yield session.call("rie.dialogue.stt.stream")
+
+    elapsed = 0.0
     while not finish_dialogue:
         yield sleep(0.5)
+        elapsed += 0.5
+        if elapsed >= timeout:
+            print(f"  [listen] Timeout after {timeout}s")
+            yield session.call("rie.dialogue.stt.close")
+            yield sleep(0.3)
+            finish_dialogue = False
+            query = ""
+            return ""
+
     yield session.call("rie.dialogue.stt.close")
     yield sleep(0.5)
     result = query
@@ -123,24 +139,44 @@ def listen(session):
     return result
 
 @inlineCallbacks
+def run_game(session, topic):
+    """
+    Run one full game for the given topic.
+    Returns the score.
+    """
+    word_list = TOPICS[topic].copy()
+    random.shuffle(word_list)
+    total = len(word_list)
+    score = 0
+
+    for i, word in enumerate(word_list, start=1):
+        success = yield play_word_round(session, word, i, total)
+        if success:
+            score += 1
+        yield sleep(0.5)
+
+    return score
+
+@inlineCallbacks
 def pick_topic(session):
     """
     Let the child choose a topic by speaking its name.
     Returns the chosen topic key (e.g. 'animals').
     """
     topic_list = ", ".join(TOPICS.keys())
-    yield say(session, f"Great! Let's play a sentence game. "
-                       f"Which topic would you like? You can choose: {topic_list}.")
+    yield say(session, f"Which topic would you like? You can choose: {topic_list}.")
     yield sleep(1)
 
     while True:
         answer = yield listen(session)
-        answer_lower = answer.lower()
+        if not answer:
+            yield say(session, f"I did not hear you. Please choose one of: {topic_list}.")
+            yield sleep(0.5)
+            continue
         for topic in TOPICS:
-            if topic in answer_lower:
+            if topic in answer.lower():
                 yield say(session, f"Awesome! Let's go with {topic}!")
                 return topic
-        # not recognised
         yield say(session, f"Hmm, I did not catch that. Please choose one of: {topic_list}.")
         yield sleep(0.5)
 
@@ -174,7 +210,6 @@ def play_word_round(session, word, word_number, total_words):
             yield sleep(1)
             return True
         else:
-            # Build retry feedback
             if attempt < MAX_RETRIES:
                 retries_left = MAX_RETRIES - attempt
                 retry_word = "try" if retries_left == 1 else "tries"
@@ -184,7 +219,6 @@ def play_word_round(session, word, word_number, total_words):
                     f"Remember to use the word '{word}' in your sentence. Give it another go!"
                 )
             else:
-                # Final attempt failed
                 feedback = (
                     f"{reason} "
                     f"That was a tough one! A good sentence could be: "
@@ -200,13 +234,14 @@ def play_word_round(session, word, word_number, total_words):
 # ─────────────────────────────────────────────
 @inlineCallbacks
 def main(session, details):
-    global finish_dialogue, query
-
     # set language to English
     yield session.call("rie.dialogue.config.language", lang="en")
 
     # robot stands up
     yield session.call("rom.optional.behavior.play", name="BlocklyStand")
+
+    # subscribe to STT once, globally
+    yield session.subscribe(asr, "rie.dialogue.stt.stream")
 
     # ── Welcome ──────────────────────────────
     yield say(session,
@@ -214,54 +249,28 @@ def main(session, details):
               "We are going to play a fun sentence game together!")
     yield sleep(1)
 
-    # subscribe to STT once, globally
-    yield session.subscribe(asr, "rie.dialogue.stt.stream")
-
-    # ── Topic selection ───────────────────────
-    chosen_topic = yield pick_topic(session)
-    word_list = TOPICS[chosen_topic].copy()
-    random.shuffle(word_list)
-
-    # ── Game loop ─────────────────────────────
-    score = 0
-    total = len(word_list)
-
-    for i, word in enumerate(word_list, start=1):
-        success = yield play_word_round(session, word, i, total)
-        if success:
-            score += 1
-        yield sleep(0.5)
-
-    # ── End of game summary ───────────────────
-    yield say(session,
-              f"Amazing work! We finished all {total} words. "
-              f"You made a correct sentence for {score} out of {total} words. "
-              f"You are doing so well! Keep practising and you will be a sentence superstar!")
-    yield sleep(2)
-
-    # ── Ask to play again ─────────────────────
-    yield say(session, "Would you like to play again with a different topic? Say yes or no.")
-    yield sleep(1)
-
-    answer = yield listen(session)
-    if "yes" in answer.lower():
-        # restart by re-calling main — simple approach: just re-run the game block
-        yield say(session, "Wonderful! Let's go again!")
-        yield sleep(1)
+    # ── Game loop (supports replay) ───────────
+    while True:
         chosen_topic = yield pick_topic(session)
-        word_list = TOPICS[chosen_topic].copy()
-        random.shuffle(word_list)
-        score = 0
-        for i, word in enumerate(word_list, start=1):
-            success = yield play_word_round(session, word, i, total)
-            if success:
-                score += 1
-            yield sleep(0.5)
+        score = yield run_game(session, chosen_topic)
+        total = len(TOPICS[chosen_topic])
+
         yield say(session,
-                  f"Great job again! You got {score} out of {len(word_list)} this time. See you next time!")
-    else:
-        yield say(session,
-                  "Okay! Great job today. Goodbye and keep up the amazing work!")
+                  f"Amazing work! We finished all {total} words. "
+                  f"You made a correct sentence for {score} out of {total} words. "
+                  f"You are doing so well! Keep practising and you will be a sentence superstar!")
+        yield sleep(2)
+
+        yield say(session, "Would you like to play again with a different topic? Say yes or no.")
+        yield sleep(1)
+        answer = yield listen(session)
+
+        if "yes" in answer.lower():
+            yield say(session, "Wonderful! Let's go again!")
+            yield sleep(1)
+        else:
+            yield say(session, "Okay! Great job today. Goodbye and keep up the amazing work!")
+            break
 
     yield sleep(1)
     yield session.call("rom.optional.behavior.play", name="BlocklyCrouch")
