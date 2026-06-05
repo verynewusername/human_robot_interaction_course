@@ -280,13 +280,8 @@ def grab_frame(session):
 
 # ─────────────────────────────────────────────
 # QR DECODE — OpenCV (no system library needed on macOS)
-# Requires: pip install opencv-python
 # ─────────────────────────────────────────────
 def decode_qr(jpeg_bytes):
-    """
-    Decode a QR code from JPEG bytes using OpenCV's built-in QR detector.
-    Works on macOS without any Homebrew/system library dependency.
-    """
     try:
         import cv2
         import numpy as np
@@ -294,7 +289,6 @@ def decode_qr(jpeg_bytes):
         arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            print("  [QR] cv2.imdecode returned None — bad JPEG?")
             return None
 
         detector = cv2.QRCodeDetector()
@@ -309,6 +303,61 @@ def decode_qr(jpeg_bytes):
     except Exception as e:
         print(f"  [QR] Decode error: {e}")
         return None
+
+# ─────────────────────────────────────────────
+# CELEBRATE GESTURE
+# Raises both arms up, pauses, then returns to rest.
+# Uses rom.actuator.motor.write — confirmed in API dump.
+#
+# Alpha Zero motor IDs (standard mapping):
+#   RightShoulderPitch : controls right arm up/down  (positive = up)
+#   LeftShoulderPitch  : controls left arm up/down   (negative = up)
+#
+# Values are in degrees. The robot's neutral stand pose
+# has arms roughly at 0. We raise to ~120° then return.
+# ─────────────────────────────────────────────
+@inlineCallbacks
+def celebrate(session):
+    """
+    Celebration gesture: both arms shoot up then return to neutral.
+    Motor values in RADIANS. Confirmed range: [-2.5943, 1.5943] rad.
+      right arm up → -1.57 rad  (just under the -2.59 limit, raises forward)
+      left arm up  →  1.57 rad  (just under the  1.59 limit)
+    """
+    if LOCAL_TEST:
+        print("[Gesture] celebrate (skipped in local-test mode)")
+        return
+
+    print("[Gesture] celebrate — arms up!")
+    try:
+        # ── Arms UP ───────────────────────────────────────────────────
+        yield session.call(
+            "rom.actuator.motor.write",
+            frames=[{
+                "time": 400,
+                "data": {
+                    "body.arms.right.upper.pitch": -1.57,
+                    "body.arms.left.upper.pitch":   1.57,
+                }
+            }]
+        )
+        yield sleep(0.6)
+
+        # ── Arms DOWN — back to neutral ───────────────────────────────
+        yield session.call(
+            "rom.actuator.motor.write",
+            frames=[{
+                "time": 400,
+                "data": {
+                    "body.arms.right.upper.pitch": 0.0,
+                    "body.arms.left.upper.pitch":  0.0,
+                }
+            }]
+        )
+        yield sleep(0.5)
+
+    except Exception as e:
+        print(f"  [Gesture] Motor write failed: {e}")
 
 # ─────────────────────────────────────────────
 # HELPERS
@@ -410,6 +459,12 @@ def play_question(session, words, q_number, total_q, streak_state):
 
         if is_valid:
             streak_state["count"] += 1
+
+            # ── Celebrate with gesture + speech simultaneously ────────
+            # celebrate() moves the arms; say() speaks — both yielded
+            # sequentially so arms go up while the robot talks.
+            yield celebrate(session)
+
             if (streak_state["count"] >= STREAK_THRESHOLD
                     and streak_state["count"] % STREAK_THRESHOLD == 0):
                 yield say(session,
@@ -417,6 +472,7 @@ def play_question(session, words, q_number, total_q, streak_state):
                           f"You are on fire! {encouragement}")
             else:
                 yield say(session, encouragement)
+
             yield sleep(1)
             return True
         else:
@@ -474,8 +530,6 @@ def run_game(session, topic):
 
 # ─────────────────────────────────────────────
 # TOPIC SELECTION — snapshot QR loop
-# Grabs a JPEG from the robot's eye camera every second,
-# decodes any QR code locally with OpenCV.
 # ─────────────────────────────────────────────
 @inlineCallbacks
 def pick_topic(session):
@@ -501,7 +555,6 @@ def pick_topic(session):
             yield sleep(0.5)
         return
 
-    # ── Robot mode: snapshot QR loop ─────────────────────────────────
     yield say(session,
               f"Show me a topic card! "
               f"You can choose: {topic_list}.")
