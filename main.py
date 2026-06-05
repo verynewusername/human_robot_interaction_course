@@ -8,15 +8,20 @@ import time
 import json
 import re
 import sys
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # ─────────────────────────────────────────────
-# LOCAL TEST FLAG
-# Run with: python main.py --local-test
+# FLAGS
+# python main.py                → Ollama local (default)
+# python main.py --gemini       → Gemini/Gemma cloud API
+# python main.py --local-test   → terminal I/O, no robot
+# Flags can be combined: python main.py --local-test --gemini
 # ─────────────────────────────────────────────
-LOCAL_TEST = "--local-test" in sys.argv
+LOCAL_TEST  = "--local-test" in sys.argv
+USE_GEMINI  = "--gemini"     in sys.argv
 
 if LOCAL_TEST:
     print("[LOCAL TEST MODE] Robot connection disabled. Using terminal I/O.")
@@ -25,6 +30,53 @@ if LOCAL_TEST:
         return succeed(None)
 else:
     from autobahn.twisted.util import sleep
+
+# ─────────────────────────────────────────────
+# OLLAMA CONFIG  (used when --gemini is NOT passed)
+# ─────────────────────────────────────────────
+OLLAMA_URL   = "http://localhost:11434"
+OLLAMA_API   = f"{OLLAMA_URL}/api/chat"
+OLLAMA_TAGS  = f"{OLLAMA_URL}/api/tags"
+
+def _detect_ollama_model():
+    """
+    Auto-detect the first Gemma model available in Ollama.
+    Falls back to the first available model of any kind.
+    Raises RuntimeError if Ollama is unreachable or has no models.
+    """
+    try:
+        resp = requests.get(OLLAMA_TAGS, timeout=5)
+        resp.raise_for_status()
+        models = [m["name"] for m in resp.json().get("models", [])]
+    except Exception as e:
+        raise RuntimeError(
+            f"[Ollama] Cannot reach Ollama at {OLLAMA_URL}. "
+            f"Is it running? (`ollama serve`)  Error: {e}"
+        )
+
+    if not models:
+        raise RuntimeError(
+            "[Ollama] Ollama is running but has no models pulled. "
+            "Run: ollama pull gemma3  (or any other model)"
+        )
+
+    # prefer any gemma variant
+    gemma_models = [m for m in models if "gemma" in m.lower()]
+    chosen = gemma_models[0] if gemma_models else models[0]
+    print(f"[Ollama] Auto-detected model: {chosen}")
+    return chosen
+
+if not USE_GEMINI:
+    OLLAMA_MODEL = _detect_ollama_model()
+
+# ─────────────────────────────────────────────
+# GEMINI CONFIG  (used when --gemini IS passed)
+# ─────────────────────────────────────────────
+GEMINI_MODEL = "gemini-1.5-flash"
+
+if USE_GEMINI:
+    chatbot = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    print(f"[Gemini] Using cloud model: {GEMINI_MODEL}")
 
 # ─────────────────────────────────────────────
 # GAME SETTINGS
@@ -55,10 +107,8 @@ TOPICS = {
 }
 
 # ─────────────────────────────────────────────
-# GEMINI CLIENT
+# PROMPTS
 # ─────────────────────────────────────────────
-chatbot = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
 VALIDATOR_PROMPT_ONE = """
 You are a friendly speech and language therapist helping a child with
 Developmental Language Disorder (DLD).
@@ -109,40 +159,88 @@ If valid is false, reason must explain simply what is wrong.
 Keep encouragement warm, short and suitable for a child.
 """
 
-def validate_sentence(words, sentence):
-    """
-    words: str (stages 1 & 2) or list of two str (stage 3).
-    Returns (is_valid, reason, encouragement).
-    """
-    if isinstance(words, list):
-        prompt = f"Target words: {words[0]}, {words[1]}\nChild's sentence: {sentence}"
-        system_prompt = VALIDATOR_PROMPT_TWO
-    else:
-        prompt = f"Target word: {words}\nChild's sentence: {sentence}"
-        system_prompt = VALIDATOR_PROMPT_ONE
+# ─────────────────────────────────────────────
+# VALIDATION — Ollama path
+# ─────────────────────────────────────────────
+def _validate_ollama(system_prompt, user_prompt):
+    """Call local Ollama, return parsed JSON dict."""
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "stream": False,
+        "format": "json",       # Ollama structured output — forces valid JSON
+    }
+    resp = requests.post(OLLAMA_API, json=payload, timeout=60)
+    resp.raise_for_status()
+    raw = resp.json()["message"]["content"].strip()
+    # strip fences just in case
+    raw = re.sub(r"^```(?:json)?\s*", "", raw)
+    raw = re.sub(r"\s*```$", "", raw)
+    return json.loads(raw)
 
+# ─────────────────────────────────────────────
+# VALIDATION — Gemini path
+# ─────────────────────────────────────────────
+def _validate_gemini(system_prompt, user_prompt):
+    """Call Gemini cloud API, return parsed JSON dict."""
     max_retries = 5
     for attempt in range(max_retries):
         try:
             response = chatbot.models.generate_content(
-                model="gemma-4-31b-it",
+                model=GEMINI_MODEL,
                 config=types.GenerateContentConfig(system_instruction=system_prompt),
-                contents=[prompt]
+                contents=[user_prompt]
             )
             raw = response.text.strip()
             raw = re.sub(r"^```(?:json)?\s*", "", raw)
             raw = re.sub(r"\s*```$", "", raw)
-            data = json.loads(raw)
-            return data["valid"], data.get("reason", ""), data.get("encouragement", "Well done!")
+            return json.loads(raw)
         except Exception as e:
             error_str = str(e)
             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
                 match = re.search(r"retry in ([\d.]+)s", error_str)
                 delay = float(match.group(1)) if match else min(2 ** attempt, 30)
-                print(f"  Rate limited. Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                print(f"  Rate limited. Retrying in {delay:.1f}s "
+                      f"(attempt {attempt + 1}/{max_retries})...")
                 time.sleep(delay)
             else:
                 raise
+    raise RuntimeError("Gemini: max retries exceeded")
+
+# ─────────────────────────────────────────────
+# UNIFIED VALIDATE ENTRY POINT
+# ─────────────────────────────────────────────
+def validate_sentence(words, sentence):
+    """
+    words: str (stages 1 & 2) or list of two str (stage 3).
+    Returns (is_valid, reason, encouragement).
+    Routes to Ollama or Gemini based on flag.
+    """
+    if isinstance(words, list):
+        user_prompt   = f"Target words: {words[0]}, {words[1]}\nChild's sentence: {sentence}"
+        system_prompt = VALIDATOR_PROMPT_TWO
+    else:
+        user_prompt   = f"Target word: {words}\nChild's sentence: {sentence}"
+        system_prompt = VALIDATOR_PROMPT_ONE
+
+    try:
+        if USE_GEMINI:
+            data = _validate_gemini(system_prompt, user_prompt)
+        else:
+            data = _validate_ollama(system_prompt, user_prompt)
+
+        return (
+            data["valid"],
+            data.get("reason", ""),
+            data.get("encouragement", "Well done!")
+        )
+    except Exception as e:
+        # graceful fallback: treat as invalid so game can continue
+        print(f"  [validate_sentence] Error: {e}")
+        return False, "I had trouble checking that. Please try again.", "Give it another go!"
 
 # ─────────────────────────────────────────────
 # STT GLOBALS
@@ -209,10 +307,6 @@ def listen(session, timeout=LISTEN_TIMEOUT):
     return result
 
 def pick_words(topic, stage, used_words):
-    """
-    Pick word(s) for the current stage, avoiding repeats where possible.
-    Returns a str (stages 1 & 2) or list of two str (stage 3).
-    """
     easy = TOPICS[topic]["easy"]
     hard = TOPICS[topic]["hard"]
     all_words = easy + hard
@@ -227,7 +321,7 @@ def pick_words(topic, stage, used_words):
         word = random.choice(pool)
         used_words.add(word)
         return word
-    else:  # stage 3
+    else:
         pool = [w for w in all_words if w not in used_words]
         if len(pool) < 2:
             pool = all_words
@@ -235,13 +329,8 @@ def pick_words(topic, stage, used_words):
         used_words.update(pair)
         return pair
 
-STAGE_LABELS = {1: "easy words", 2: "harder words", 3: "two words at once"}
-
 @inlineCallbacks
 def play_question(session, words, q_number, total_q, streak_state):
-    """
-    Ask one question. Returns True if child succeeded.
-    """
     MAX_RETRIES = 4
 
     if isinstance(words, list):
@@ -267,8 +356,11 @@ def play_question(session, words, q_number, total_q, streak_state):
 
         if is_valid:
             streak_state["count"] += 1
-            if streak_state["count"] >= STREAK_THRESHOLD and streak_state["count"] % STREAK_THRESHOLD == 0:
-                yield say(session, f"Wow, {streak_state['count']} in a row! You are on fire! {encouragement}")
+            if (streak_state["count"] >= STREAK_THRESHOLD
+                    and streak_state["count"] % STREAK_THRESHOLD == 0):
+                yield say(session,
+                          f"Wow, {streak_state['count']} in a row! "
+                          f"You are on fire! {encouragement}")
             else:
                 yield say(session, encouragement)
             yield sleep(1)
@@ -285,22 +377,18 @@ def play_question(session, words, q_number, total_q, streak_state):
                 example = (f"'I see a {words[0]} in the {words[1]}.'"
                            if isinstance(words, list) else f"'I like the {words}.'")
                 yield say(session,
-                          f"{reason} That was a tough one! A good sentence could be: {example} Let's move on!")
+                          f"{reason} That was a tough one! "
+                          f"A good sentence could be: {example} Let's move on!")
             yield sleep(1)
 
     return False
 
 @inlineCallbacks
 def run_game(session, topic):
-    """
-    Always 6 questions across 3 rounds of 2.
-    Stage goes up if 2/2 correct, stays the same otherwise.
-    Max stage is 3 (two-word) — never goes higher.
-    """
     streak_state = {"count": 0}
-    used_words = set()
-    total_score = 0
-    stage = 1
+    used_words   = set()
+    total_score  = 0
+    stage        = 1
     TOTAL_ROUNDS = 3
 
     stage_labels = {1: "easy words", 2: "harder words", 3: "two words at once"}
@@ -308,53 +396,50 @@ def run_game(session, topic):
                     2: "Amazing! Now for the ultimate challenge!"}
 
     for round_num in range(1, TOTAL_ROUNDS + 1):
-        yield say(session, f"Round {round_num} of {TOTAL_ROUNDS} — {stage_labels[stage]}!")
+        yield say(session,
+                  f"Round {round_num} of {TOTAL_ROUNDS} — {stage_labels[stage]}!")
         yield sleep(1)
 
         round_score = 0
         for q in range(2):
             q_number = (round_num - 1) * 2 + q + 1
-            words = pick_words(topic, stage, used_words)
-            success = yield play_question(session, words, q_number, 6, streak_state)
+            words    = pick_words(topic, stage, used_words)
+            success  = yield play_question(session, words, q_number, 6, streak_state)
             if success:
                 round_score += 1
                 total_score += 1
             yield sleep(0.5)
 
-        # Adjust stage for next round (not after the last round)
         if round_num < TOTAL_ROUNDS:
             if round_score == 2 and stage < 3:
                 stage += 1
                 yield say(session, up_messages.get(stage - 1, "Great job!"))
                 yield sleep(1)
-            # else: stay at same stage, no comment needed
 
     return total_score, 6
 
 @inlineCallbacks
 def pick_topic(session):
-    """
-    Let the child choose a topic by showing a QR card (on robot)
-    or by typing/speaking (local test).
-    QR card should encode the topic name: 'animals', 'food', 'school', or 'weather'.
-    """
     global qr_result
     topic_list = ", ".join(TOPICS.keys())
 
     if LOCAL_TEST:
-        yield say(session, f"Which topic would you like? You can choose: {topic_list}.")
+        yield say(session,
+                  f"Which topic would you like? You can choose: {topic_list}.")
         yield sleep(1)
         while True:
             answer = yield listen(session)
             if not answer:
-                yield say(session, f"I did not hear you. Please choose one of: {topic_list}.")
+                yield say(session,
+                          f"I did not hear you. Please choose one of: {topic_list}.")
                 yield sleep(0.5)
                 continue
             for topic in TOPICS:
                 if topic in answer.lower():
                     yield say(session, f"Awesome! Let's go with {topic}!")
                     return topic
-            yield say(session, f"Hmm, I did not catch that. Please choose one of: {topic_list}.")
+            yield say(session,
+                      f"Hmm, I did not catch that. Please choose one of: {topic_list}.")
             yield sleep(0.5)
     else:
         yield say(session,
@@ -364,15 +449,17 @@ def pick_topic(session):
 
         while True:
             qr_result = None
-            elapsed = 0.0
+            elapsed   = 0.0
             while qr_result is None:
                 yield sleep(0.5)
                 elapsed += 0.5
                 if elapsed > 30:
-                    yield say(session, f"I did not see a card. Please show me one of: {topic_list}.")
+                    yield say(session,
+                              f"I did not see a card. "
+                              f"Please show me one of: {topic_list}.")
                     elapsed = 0.0
 
-            topic = qr_result.lower().strip()
+            topic     = qr_result.lower().strip()
             qr_result = None
 
             if topic in TOPICS:
@@ -380,7 +467,9 @@ def pick_topic(session):
                 yield say(session, f"Awesome! Let's go with {topic}!")
                 return topic
             else:
-                yield say(session, f"I do not recognise that card. Please try one of: {topic_list}.")
+                yield say(session,
+                          f"I do not recognise that card. "
+                          f"Please try one of: {topic_list}.")
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -416,7 +505,8 @@ def main(session, details):
             yield say(session, "Wonderful! Let's go again!")
             yield sleep(1)
         else:
-            yield say(session, "Okay! Great job today. Goodbye and keep up the amazing work!")
+            yield say(session,
+                      "Okay! Great job today. Goodbye and keep up the amazing work!")
             break
 
     if not LOCAL_TEST:
