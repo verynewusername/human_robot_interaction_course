@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+GEMMA_MODEL = "gemma-4-31b-it"
 # ─────────────────────────────────────────────
 # LOCAL TEST FLAG
 # Run with: python main.py --local-test
@@ -125,7 +126,7 @@ def validate_sentence(words, sentence):
     for attempt in range(max_retries):
         try:
             response = chatbot.models.generate_content(
-                model="gemini-2.0-flash",
+                model=GEMMA_MODEL,
                 config=types.GenerateContentConfig(system_instruction=system_prompt),
                 contents=[prompt]
             )
