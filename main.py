@@ -65,7 +65,7 @@ def validate_sentence(target_word, sentence):
     for attempt in range(max_retries):
         try:
             response = chatbot.models.generate_content(
-                model="gemini-2.0-flash",
+                model="GEMMA 3 27b",
                 config=types.GenerateContentConfig(
                     system_instruction=VALIDATOR_PROMPT
                 ),
