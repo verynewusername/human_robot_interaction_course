@@ -5,6 +5,7 @@ from google import genai
 from google.genai import types
 import random
 import os
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -54,20 +55,34 @@ Keep encouragement warm, short and suitable for a child.
 def validate_sentence(target_word, sentence):
     """Ask Gemini to validate the child's sentence. Returns (is_valid, reason, encouragement)."""
     prompt = f"Target word: {target_word}\nChild's sentence: {sentence}"
-    response = chatbot.models.generate_content(
-        model="gemini-2.0-flash",
-        config=types.GenerateContentConfig(
-            system_instruction=VALIDATOR_PROMPT
-        ),
-        contents=[prompt]
-    )
-    import json, re
-    raw = response.text.strip()
-    # strip markdown code fences if Gemini wraps in ```json ... ```
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    data = json.loads(raw)
-    return data["valid"], data.get("reason", ""), data.get("encouragement", "Well done!")
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            response = chatbot.models.generate_content(
+                model="gemini-2.0-flash",
+                config=types.GenerateContentConfig(
+                    system_instruction=VALIDATOR_PROMPT
+                ),
+                contents=[prompt]
+            )
+            import json, re
+            raw = response.text.strip()
+            # strip markdown code fences if Gemini wraps in ```json ... ```
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            data = json.loads(raw)
+            return data["valid"], data.get("reason", ""), data.get("encouragement", "Well done!")
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                import re as re2
+                match = re2.search(r"retry in ([\d.]+)s", error_str)
+                delay = float(match.group(1)) if match else min(2 ** attempt, 30)
+                print(f"  Rate limited. Retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(delay)
+            else:
+                raise
 
 # ─────────────────────────────────────────────
 # STT GLOBALS
@@ -77,7 +92,7 @@ query = ""
 
 def asr(frames):
     global finish_dialogue, query
-    if frames["data"]["body"]["final"]:
+    if frames["data"]["body"]["final"] and not finish_dialogue:
         query = str(frames["data"]["body"]["text"]).strip()
         print("Person said:", query)
         finish_dialogue = True
