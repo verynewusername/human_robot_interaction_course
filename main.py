@@ -164,6 +164,18 @@ def asr(frames):
         finish_dialogue = True
 
 # ─────────────────────────────────────────────
+# QR GLOBALS
+# ─────────────────────────────────────────────
+qr_result = None
+
+def on_qr(frames):
+    global qr_result
+    value = frames["data"]["body"].get("text", "").strip().lower()
+    if value and qr_result is None:
+        print(f"QR detected: {value}")
+        qr_result = value
+
+# ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
 @inlineCallbacks
@@ -329,22 +341,54 @@ def run_game(session, topic):
 
 @inlineCallbacks
 def pick_topic(session):
+    """
+    Let the child choose a topic by showing a QR card (on robot)
+    or by typing/speaking (local test).
+    QR card should encode the topic name: 'animals', 'food', 'school', or 'weather'.
+    """
+    global qr_result
     topic_list = ", ".join(TOPICS.keys())
-    yield say(session, f"Which topic would you like? You can choose: {topic_list}.")
-    yield sleep(1)
 
-    while True:
-        answer = yield listen(session)
-        if not answer:
-            yield say(session, f"I did not hear you. Please choose one of: {topic_list}.")
+    if LOCAL_TEST:
+        yield say(session, f"Which topic would you like? You can choose: {topic_list}.")
+        yield sleep(1)
+        while True:
+            answer = yield listen(session)
+            if not answer:
+                yield say(session, f"I did not hear you. Please choose one of: {topic_list}.")
+                yield sleep(0.5)
+                continue
+            for topic in TOPICS:
+                if topic in answer.lower():
+                    yield say(session, f"Awesome! Let's go with {topic}!")
+                    return topic
+            yield say(session, f"Hmm, I did not catch that. Please choose one of: {topic_list}.")
             yield sleep(0.5)
-            continue
-        for topic in TOPICS:
-            if topic in answer.lower():
+    else:
+        yield say(session,
+                  f"Show me a topic card to get started! "
+                  f"You can choose: {topic_list}.")
+        yield session.call("rie.vision.qrcode.stream")
+
+        while True:
+            qr_result = None
+            elapsed = 0.0
+            while qr_result is None:
+                yield sleep(0.5)
+                elapsed += 0.5
+                if elapsed > 30:
+                    yield say(session, f"I did not see a card. Please show me one of: {topic_list}.")
+                    elapsed = 0.0
+
+            topic = qr_result.lower().strip()
+            qr_result = None
+
+            if topic in TOPICS:
+                yield session.call("rie.vision.qrcode.close")
                 yield say(session, f"Awesome! Let's go with {topic}!")
                 return topic
-        yield say(session, f"Hmm, I did not catch that. Please choose one of: {topic_list}.")
-        yield sleep(0.5)
+            else:
+                yield say(session, f"I do not recognise that card. Please try one of: {topic_list}.")
 
 # ─────────────────────────────────────────────
 # MAIN
@@ -355,6 +399,7 @@ def main(session, details):
         yield session.call("rie.dialogue.config.language", lang="en")
         yield session.call("rom.optional.behavior.play", name="BlocklyStand")
         yield session.subscribe(asr, "rie.dialogue.stt.stream")
+        yield session.subscribe(on_qr, "rie.vision.qrcode")
 
     yield say(session,
               "Hello! I am your language buddy. "
