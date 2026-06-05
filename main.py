@@ -12,7 +12,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GEMMA_MODEL = "gemma-4-31b-it"
 # ─────────────────────────────────────────────
 # LOCAL TEST FLAG
 # Run with: python main.py --local-test
@@ -32,12 +31,6 @@ else:
 # ─────────────────────────────────────────────
 LISTEN_TIMEOUT   = 15
 STREAK_THRESHOLD = 3
-QUESTIONS_PER_ROUND = 2   # questions at the same difficulty before re-evaluating
-MAX_ROUNDS       = 5      # game ends after this many rounds regardless
-
-# Stages: 1 = easy word, 2 = hard word, 3 = two words
-MIN_STAGE = 1
-MAX_STAGE = 3
 
 # ─────────────────────────────────────────────
 # WORD SETS PER TOPIC
@@ -132,7 +125,7 @@ def validate_sentence(words, sentence):
     for attempt in range(max_retries):
         try:
             response = chatbot.models.generate_content(
-                model=GEMMA_MODEL,
+                model="gemini-2.0-flash",
                 config=types.GenerateContentConfig(system_instruction=system_prompt),
                 contents=[prompt]
             )
@@ -300,45 +293,43 @@ def play_question(session, words, q_number, total_q, streak_state):
 @inlineCallbacks
 def run_game(session, topic):
     """
-    Adaptive game loop:
-    - Each round = QUESTIONS_PER_ROUND questions at the current stage
-    - 2/2 correct → stage up | 0/2 correct → stage down | 1/2 → stay
-    - Ends after MAX_ROUNDS rounds
+    Always 6 questions across 3 rounds of 2.
+    Stage goes up if 2/2 correct, stays the same otherwise.
+    Max stage is 3 (two-word) — never goes higher.
     """
-    stage = MIN_STAGE
     streak_state = {"count": 0}
     used_words = set()
     total_score = 0
-    total_questions = MAX_ROUNDS * QUESTIONS_PER_ROUND
-    q_number = 0
+    stage = 1
+    TOTAL_ROUNDS = 3
 
-    for round_num in range(1, MAX_ROUNDS + 1):
-        yield say(session,
-                  f"Round {round_num} of {MAX_ROUNDS} — {STAGE_LABELS[stage]}!")
+    stage_labels = {1: "easy words", 2: "harder words", 3: "two words at once"}
+    up_messages  = {1: "Nice work! Let's go a bit harder.",
+                    2: "Amazing! Now for the ultimate challenge!"}
+
+    for round_num in range(1, TOTAL_ROUNDS + 1):
+        yield say(session, f"Round {round_num} of {TOTAL_ROUNDS} — {stage_labels[stage]}!")
         yield sleep(1)
 
         round_score = 0
-        for _ in range(QUESTIONS_PER_ROUND):
-            q_number += 1
+        for q in range(2):
+            q_number = (round_num - 1) * 2 + q + 1
             words = pick_words(topic, stage, used_words)
-            success = yield play_question(session, words, q_number, total_questions, streak_state)
+            success = yield play_question(session, words, q_number, 6, streak_state)
             if success:
                 round_score += 1
                 total_score += 1
             yield sleep(0.5)
 
-        # Adaptive stage adjustment
-        if round_score == QUESTIONS_PER_ROUND and stage < MAX_STAGE:
-            stage += 1
-            yield say(session, "Great job! Let's make it a bit harder.")
-        elif round_score == 0 and stage > MIN_STAGE:
-            stage -= 1
-            yield say(session, "No worries! Let's go back to something easier.")
-        # else: stay at same stage, no announcement needed
+        # Adjust stage for next round (not after the last round)
+        if round_num < TOTAL_ROUNDS:
+            if round_score == 2 and stage < 3:
+                stage += 1
+                yield say(session, up_messages.get(stage - 1, "Great job!"))
+                yield sleep(1)
+            # else: stay at same stage, no comment needed
 
-        yield sleep(0.5)
-
-    return total_score, total_questions
+    return total_score, 6
 
 @inlineCallbacks
 def pick_topic(session):
